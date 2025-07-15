@@ -79,7 +79,16 @@ namespace TensileLite
             double denominator = (m * n + n * k + m * k) * bytes_per_element;
             return numerator / denominator;
         }
+        bool is_tf32_emulation_enabled()
+        {
+            const char* env = std::getenv("ORIGAMI_USE_TF32");
+            if(!env)
+                return false;
 
+            std::string val(env);
+            std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+            return val == "1" || val == "true" || val == "yes";
+        }
         // Determine the compute latency per MT_MxMT_NxMT_K Macro Tile (L_MT).
         size_t compute_mt_compute_latency(const Hardware& hardware,
                                           size_t          M,
@@ -97,14 +106,60 @@ namespace TensileLite
                                           size_t          element_size_B,
                                           bool            debug)
         {
+            bool   tf32_emulation = is_tf32_emulation_enabled();
+            size_t extra_overhead = 0;
 
             // Compute the number of matrix instructions
             size_t N_MI = compute_number_matrix_instructions(
                 hardware, MT_M, MT_N, MT_K, MI_M, MI_N, MI_K, debug);
             // Latency of a single MT_MxMT_NxMT_k tile is the latency of one MI multiplied by number of MI per MT_MxMT_NxMT_k.
-            size_t L_MI = hardware.get_MI_latency(
-                MI_M, MI_N, MI_K, std::max(element_size_A, element_size_B));
+            size_t L_MI = 32000;
 
+            //Special Logic for handling TF32 emulation using 3x bf16 multiply accumulates.
+            if(tf32_emulation && (element_size_A == 32 || element_size_B == 32))
+            {
+                //The TF32 emulation dataflow is as follows:
+                //Take (as input per workgroup) a tile of dimensionality (MT_MxMT_NxMT_K)
+                //Break the two input tiles in f32 (MT_MxMT_K and MT_NxMT_K) into two bf16 partials
+                //The bf16 partials are a_1|a_0 and b_1|b_0 respectively, with b_1 being most significant.
+                //We would normally multiply accumulate the cross product (4 tile multiplies) into the output (MT_MxMT_N)
+                //If we are willing to tolerate a minor loss of accuracy, we can do this with 3 of the 4 multiplies instead.
+                //This means we will do 3x the number of MFMA operations
+                const char* env        = getenv("BF16_MULTIPLY_COUNT");
+                int         bf16_count = 3;
+                if(env)
+                {
+                    char* end;
+                    long  v = strtol(env, &end, 10);
+                    if(end != env && v > 0)
+                    {
+                        bf16_count = (int)v;
+                    }
+                    else
+                    {
+                        fprintf(stderr,
+                                "Warning: BF16_MULTIPLY_COUNT=\"%s\" is not a positive integer; "
+                                "using %d\n",
+                                env,
+                                bf16_count);
+                    }
+                }
+                N_MI = bf16_count * N_MI; //We are going to emulate with 3 BF16 multiplies
+                L_MI = hardware.get_MI_latency(MI_M, MI_N, MI_K, 16);
+
+                //Conversion overhead scales in input tile sizes
+                size_t tile_size_a = MT_M * MT_K;
+                size_t tile_size_b = MT_N * MT_K;
+                //Each tile will have three conversion and two subtractions (5 ops) across 64 lanes in parallel.
+                extra_overhead += safe_ceil_div(tile_size_a * 5, 64);
+                extra_overhead += safe_ceil_div(tile_size_b * 5, 64);
+            }
+            else
+            {
+                // Latency of a single MT_MxMT_NxMT_k tile is the latency of one MI multiplied by number of MI per MT_MxMT_NxMT_k.
+                L_MI = hardware.get_MI_latency(
+                    MI_M, MI_N, MI_K, std::max(element_size_A, element_size_B));
+            }
             // size_t mt_arith = arithmetic_intensity(MT_M, MT_N, MT_K, 2);
             // printf("MT_M:%d MT_N:%d MT_K:%d arith:%d\n", MT_M, MT_N, MT_K, mt_arith);
             // size_t arith = ((M * N * K * 2) / (M * K + N * K + M * N));
@@ -486,6 +541,8 @@ namespace TensileLite
                                                   element_size_B,
                                                   mx_block_size,
                                                   debug);
+
+            bool tf32_enabled = is_tf32_emulation_enabled();
 
             // 2) Work-group setup & iteration latencies
             double L_WG_setup = 1; //WG_setup_Latency
